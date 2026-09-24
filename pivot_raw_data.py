@@ -1,11 +1,5 @@
 #!/usr/bin/env python3
-"""Create the requested three-level budget pivot table from a raw CSV file.
-
-By default, the output hierarchy matches the supplied example:
-
-    Dept Name -> Cost Group -> Cost Category -> Grand Total
-
-The three source columns can be changed with --group-columns. Group values are
+"""The three source columns can be changed with --group-columns. Group values are
 always discovered from the current data; no department, group, or category
 names are hard-coded.
 
