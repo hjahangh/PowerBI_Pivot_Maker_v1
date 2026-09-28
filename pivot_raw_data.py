@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""The three source columns can be changed with --group-columns. Group values are
+"""By default, the output The hierarchy is as follows:
+
+    Dept Name -> Cost Group -> Cost Category -> Grand Total
+
+The three source columns can be changed with --group-columns. Group values are
 always discovered from the current data; no department, group, or category
 names are hard-coded.
 
@@ -11,18 +15,20 @@ from __future__ import annotations
 import argparse
 import csv
 import io
+import posixpath
 import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Optional, TextIO, Tuple
+from xml.etree import ElementTree
 from xml.sax.saxutils import escape
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_INPUT = SCRIPT_DIR / "data.csv"
-DEFAULT_OUTPUT = SCRIPT_DIR / "pivoted_report.xlsx"
+DEFAULT_INPUT = SCRIPT_DIR / "data.xlsx"
+DEFAULT_OUTPUT = SCRIPT_DIR / "PowerBI_Pivot.xlsx"
 DEFAULT_GROUP_FIELDS: Tuple[str, ...] = (
     "Dept Name",
     "Cost Group",
@@ -71,8 +77,184 @@ def decode_csv(path: Path) -> str:
         return data.decode("cp1252")
 
 
+XLSX_MAIN_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+XLSX_DOC_REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+XLSX_PACKAGE_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+
+
+def excel_column_index(reference: str) -> int:
+    """Convert an Excel cell reference such as AA12 to a zero-based column."""
+
+    letters = "".join(character for character in reference if character.isalpha())
+    if not letters:
+        raise ValueError(f"Invalid Excel cell reference: {reference!r}")
+    number = 0
+    for letter in letters.upper():
+        number = number * 26 + ord(letter) - ord("A") + 1
+    return number - 1
+
+
+def read_shared_strings(workbook: zipfile.ZipFile) -> List[str]:
+    """Load the optional shared-string table from an Excel workbook."""
+
+    if "xl/sharedStrings.xml" not in workbook.namelist():
+        return []
+    root = ElementTree.fromstring(workbook.read("xl/sharedStrings.xml"))
+    text_tag = f"{{{XLSX_MAIN_NS}}}t"
+    return ["".join(node.text or "" for node in item.iter(text_tag)) for item in root]
+
+
+def excel_cell_value(cell: ElementTree.Element, shared_strings: List[str]) -> str:
+    """Return the stored value of an Excel cell as text."""
+
+    cell_type = cell.get("t")
+    if cell_type == "inlineStr":
+        text_tag = f"{{{XLSX_MAIN_NS}}}t"
+        return "".join(node.text or "" for node in cell.iter(text_tag))
+
+    value_node = cell.find(f"{{{XLSX_MAIN_NS}}}v")
+    if value_node is None or value_node.text is None:
+        return ""
+    value = value_node.text
+
+    if cell_type == "s":
+        try:
+            return shared_strings[int(value)]
+        except (ValueError, IndexError) as error:
+            raise ValueError(f"Invalid shared-string index: {value!r}") from error
+    if cell_type == "b":
+        return "TRUE" if value == "1" else "FALSE"
+    return value
+
+
+def resolve_worksheet_path(
+    workbook: zipfile.ZipFile, sheet_name: Optional[str]
+) -> Tuple[str, str]:
+    """Resolve a worksheet name to its XML part inside the workbook."""
+
+    workbook_root = ElementTree.fromstring(workbook.read("xl/workbook.xml"))
+    sheet_tag = f"{{{XLSX_MAIN_NS}}}sheet"
+    sheets = list(workbook_root.iter(sheet_tag))
+    if not sheets:
+        raise ValueError("The input workbook contains no worksheets")
+
+    if sheet_name is None:
+        sheet = next((item for item in sheets if item.get("state") != "hidden"), sheets[0])
+    else:
+        sheet = next((item for item in sheets if item.get("name") == sheet_name), None)
+        if sheet is None:
+            sheet = next(
+                (item for item in sheets if (item.get("name") or "").casefold() == sheet_name.casefold()),
+                None,
+            )
+        if sheet is None:
+            available = ", ".join(repr(item.get("name")) for item in sheets)
+            raise ValueError(f"Worksheet {sheet_name!r} not found; available: {available}")
+
+    relationship_id = sheet.get(f"{{{XLSX_DOC_REL_NS}}}id")
+    relationships_root = ElementTree.fromstring(
+        workbook.read("xl/_rels/workbook.xml.rels")
+    )
+    relationship_tag = f"{{{XLSX_PACKAGE_REL_NS}}}Relationship"
+    targets = {
+        item.get("Id"): item.get("Target")
+        for item in relationships_root.iter(relationship_tag)
+    }
+    target = targets.get(relationship_id)
+    if not target:
+        raise ValueError(f"Cannot locate worksheet XML for {sheet.get('name')!r}")
+
+    if target.startswith("/"):
+        worksheet_path = target.lstrip("/")
+    elif target.startswith("xl/"):
+        worksheet_path = target
+    else:
+        worksheet_path = posixpath.normpath(posixpath.join("xl", target))
+    return worksheet_path, sheet.get("name") or ""
+
+
+def read_xlsx_table(
+    path: Path, sheet_name: Optional[str]
+) -> Tuple[List[str], List[Tuple[int, Dict[str, str]]], str]:
+    """Read the first table-like worksheet from an .xlsx file."""
+
+    try:
+        workbook = zipfile.ZipFile(path)
+    except zipfile.BadZipFile as error:
+        raise ValueError(f"Not a valid .xlsx workbook: {path}") from error
+
+    with workbook:
+        worksheet_path, selected_sheet = resolve_worksheet_path(workbook, sheet_name)
+        shared_strings = read_shared_strings(workbook)
+        worksheet = ElementTree.fromstring(workbook.read(worksheet_path))
+
+    row_tag = f"{{{XLSX_MAIN_NS}}}row"
+    cell_tag = f"{{{XLSX_MAIN_NS}}}c"
+    worksheet_rows: List[Tuple[int, Dict[int, str]]] = []
+    for fallback_number, row in enumerate(worksheet.iter(row_tag), start=1):
+        row_number = int(row.get("r") or fallback_number)
+        values: Dict[int, str] = {}
+        for cell in row.findall(cell_tag):
+            reference = cell.get("r") or ""
+            values[excel_column_index(reference)] = excel_cell_value(cell, shared_strings)
+        if any(value.strip() for value in values.values()):
+            worksheet_rows.append((row_number, values))
+
+    if not worksheet_rows:
+        raise ValueError(f"Worksheet {selected_sheet!r} is empty")
+
+    _header_row_number, header_cells = worksheet_rows[0]
+    last_header_column = max(header_cells)
+    fieldnames = [header_cells.get(column, "").strip() for column in range(last_header_column + 1)]
+    named_fields = [field for field in fieldnames if field]
+    if len(named_fields) != len(set(named_fields)):
+        raise ValueError(f"Worksheet {selected_sheet!r} contains duplicate column names")
+
+    records: List[Tuple[int, Dict[str, str]]] = []
+    for row_number, cells in worksheet_rows[1:]:
+        record = {
+            field: cells.get(column, "")
+            for column, field in enumerate(fieldnames)
+            if field
+        }
+        records.append((row_number, record))
+    return fieldnames, records, selected_sheet
+
+
+def read_csv_table(path: Path) -> Tuple[List[str], List[Tuple[int, Dict[str, str]]], str]:
+    """Read a CSV input for backward compatibility."""
+
+    reader = csv.DictReader(io.StringIO(decode_csv(path), newline=""))
+    if reader.fieldnames is None:
+        raise ValueError("The input CSV has no header row")
+    fieldnames = [str(field) for field in reader.fieldnames]
+    records: List[Tuple[int, Dict[str, str]]] = []
+    for row_number, row in enumerate(reader, start=2):
+        normalized_row = {
+            str(key): "" if value is None else str(value)
+            for key, value in row.items()
+            if key is not None
+        }
+        records.append((row_number, normalized_row))
+
+    return fieldnames, records, "CSV"
+
+
+def read_input_table(
+    path: Path, sheet_name: Optional[str]
+) -> Tuple[List[str], List[Tuple[int, Dict[str, str]]], str]:
+    """Read a supported spreadsheet input."""
+
+    suffix = path.suffix.casefold()
+    if suffix == ".xlsx":
+        return read_xlsx_table(path, sheet_name)
+    if suffix == ".csv":
+        return read_csv_table(path)
+    raise ValueError("Input must have an .xlsx or .csv extension")
+
+
 def parse_amount(value: Optional[str], field_name: str, row_number: int) -> Optional[Decimal]:
-    """Convert common CSV currency forms to Decimal; blanks remain None."""
+    """Convert common spreadsheet currency forms to Decimal; blanks remain None."""
 
     if value is None or not value.strip():
         return None
@@ -98,6 +280,7 @@ def parse_amount(value: Optional[str], field_name: str, row_number: int) -> Opti
 def load_totals(
     input_path: Path,
     group_fields: Tuple[str, str, str] = DEFAULT_GROUP_FIELDS,
+    sheet_name: Optional[str] = None,
 ) -> Tuple[
     Dict[str, Totals],
     Dict[Tuple[str, str], Totals],
@@ -107,12 +290,9 @@ def load_totals(
 ]:
     """Read detail rows and aggregate all three hierarchy levels."""
 
-    reader = csv.DictReader(io.StringIO(decode_csv(input_path), newline=""))
-    if reader.fieldnames is None:
-        raise ValueError("The input CSV has no header row")
-
+    fieldnames, records, _selected_sheet = read_input_table(input_path, sheet_name)
     required = set(group_fields + VALUE_FIELDS)
-    missing = sorted(required.difference(reader.fieldnames))
+    missing = sorted(required.difference(fieldnames))
     if missing:
         raise ValueError("Missing required column(s): " + ", ".join(missing))
 
@@ -122,10 +302,10 @@ def load_totals(
     grand_total = Totals()
     detail_count = 0
 
-    for row_number, row in enumerate(reader, start=2):
+    for row_number, row in records:
         labels = tuple((row.get(field) or "").strip() for field in group_fields)
 
-        # Ignore completely blank lines in otherwise valid CSV files.
+        # Ignore completely blank spreadsheet rows.
         if not any(labels):
             continue
         if not all(labels):
@@ -206,6 +386,7 @@ def write_csv(
     output_file: TextIO,
     style: str,
     group_fields: Tuple[str, str, str] = DEFAULT_GROUP_FIELDS,
+    sheet_name: Optional[str] = None,
 ) -> int:
     """Write the pivot as a CSV compatible with the supplied example."""
 
@@ -215,7 +396,7 @@ def write_csv(
         category_totals,
         grand_total,
         detail_count,
-    ) = load_totals(input_path, group_fields)
+    ) = load_totals(input_path, group_fields, sheet_name)
 
     writer = csv.writer(output_file, lineterminator="\n")
     writer.writerow(OUTPUT_HEADER)
@@ -312,6 +493,7 @@ def write_xlsx(
     input_path: Path,
     output_path: Path,
     group_fields: Tuple[str, str, str] = DEFAULT_GROUP_FIELDS,
+    sheet_name: Optional[str] = None,
 ) -> int:
     """Write a styled Excel workbook without requiring third-party packages."""
 
@@ -321,7 +503,7 @@ def write_xlsx(
         category_totals,
         grand_total,
         detail_count,
-    ) = load_totals(input_path, group_fields)
+    ) = load_totals(input_path, group_fields, sheet_name)
     rows = list(
         pivot_rows(
             department_totals, group_totals, category_totals, grand_total
@@ -411,7 +593,7 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         nargs="?",
         default=DEFAULT_INPUT,
-        help="input CSV path (default: data.csv beside this script)",
+        help="input workbook path (default: data.xlsx beside this script)",
     )
     parser.add_argument(
         "-o",
@@ -420,7 +602,7 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_OUTPUT,
         help=(
             "output .xlsx or .csv path "
-            "(default: pivoted_report.xlsx beside this script)"
+            "(default: PowerBI_Pivot.xlsx beside this script)"
         ),
     )
     parser.add_argument(
@@ -440,6 +622,10 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--sheet",
+        help="worksheet name to read (default: first visible worksheet)",
+    )
+    parser.add_argument(
         "--no-timestamp",
         action="store_true",
         help="use the exact output filename instead of appending a timestamp",
@@ -454,7 +640,7 @@ def main() -> None:
     requested_output = args.output.expanduser()
 
     if not input_path.is_file():
-        raise SystemExit(f"Input CSV not found: {input_path}")
+        raise SystemExit(f"Input workbook not found: {input_path}")
     if input_path.resolve() == requested_output.resolve():
         raise SystemExit("Input and output paths must be different")
 
@@ -466,11 +652,13 @@ def main() -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     suffix = output_path.suffix.casefold()
     if suffix == ".xlsx":
-        detail_count = write_xlsx(input_path, output_path, group_fields)
+        detail_count = write_xlsx(
+            input_path, output_path, group_fields, args.sheet
+        )
     elif suffix == ".csv":
         with output_path.open("w", encoding="utf-8-sig", newline="") as output_file:
             detail_count = write_csv(
-                input_path, output_file, args.format, group_fields
+                input_path, output_file, args.format, group_fields, args.sheet
             )
     else:
         raise SystemExit("Output must have an .xlsx or .csv extension")
@@ -479,4 +667,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-    
