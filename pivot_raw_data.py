@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""By default, the output The hierarchy is as follows:
+"""Create the requested three-level budget pivot table from a raw Excel file.
+
+By default, the output hierarchy matches the supplied example:
 
     Dept Name -> Cost Group -> Cost Category -> Grand Total
 
@@ -29,7 +31,7 @@ from xml.sax.saxutils import escape
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_INPUT = SCRIPT_DIR / "data.xlsx"
 DEFAULT_OUTPUT = SCRIPT_DIR / "PowerBI_Pivot.xlsx"
-DEFAULT_GROUP_FIELDS: Tuple[str, ...] = (
+DEFAULT_GROUP_FIELDS: Tuple[str, str, str] = (
     "Dept Name",
     "Cost Group",
     "Cost Category",
@@ -65,6 +67,62 @@ class Totals:
             if amount is not None:
                 self.values[index] += amount
                 self.has_value[index] = True
+
+
+@dataclass
+class PivotData:
+    """Aggregated values for every level of the pivot hierarchy."""
+
+    departments: Dict[str, Totals] = field(default_factory=dict)
+    groups: Dict[Tuple[str, str], Totals] = field(default_factory=dict)
+    categories: Dict[Tuple[str, str, str], Totals] = field(default_factory=dict)
+    grand_total: Totals = field(default_factory=Totals)
+    detail_count: int = 0
+
+    def add(
+        self,
+        labels: Tuple[str, str, str],
+        amounts: Iterable[Optional[Decimal]],
+    ) -> None:
+        department, group, category = labels
+        amount_list = list(amounts)
+        self.departments.setdefault(department, Totals()).add(amount_list)
+        self.groups.setdefault((department, group), Totals()).add(amount_list)
+        self.categories.setdefault((department, group, category), Totals()).add(
+            amount_list
+        )
+        self.grand_total.add(amount_list)
+        self.detail_count += 1
+
+    def rows(self) -> Iterator[Tuple[str, str, Totals]]:
+        """Yield formatted hierarchy rows in deterministic display order."""
+
+        for department in sorted(self.departments, key=str.casefold):
+            yield "department", department, self.departments[department]
+
+            groups = sorted(
+                (group for dept, group in self.groups if dept == department),
+                key=str.casefold,
+            )
+            for group in groups:
+                yield "group", group, self.groups[(department, group)]
+
+                categories = sorted(
+                    (
+                        category
+                        for dept, grp, category in self.categories
+                        if dept == department and grp == group
+                    ),
+                    key=str.casefold,
+                )
+                for category in categories:
+                    yield (
+                        "category",
+                        category,
+                        self.categories[(department, group, category)],
+                    )
+
+        yield "grand", "Grand Total", self.grand_total
 
 
 def decode_csv(path: Path) -> str:
@@ -194,9 +252,10 @@ def read_xlsx_table(
     for fallback_number, row in enumerate(worksheet.iter(row_tag), start=1):
         row_number = int(row.get("r") or fallback_number)
         values: Dict[int, str] = {}
-        for cell in row.findall(cell_tag):
-            reference = cell.get("r") or ""
-            values[excel_column_index(reference)] = excel_cell_value(cell, shared_strings)
+        for position, cell in enumerate(row.findall(cell_tag)):
+            reference = cell.get("r")
+            column = excel_column_index(reference) if reference else position
+            values[column] = excel_cell_value(cell, shared_strings)
         if any(value.strip() for value in values.values()):
             worksheet_rows.append((row_number, values))
 
@@ -277,6 +336,54 @@ def parse_amount(value: Optional[str], field_name: str, row_number: int) -> Opti
     return -amount if negative else amount
 
 
+def aggregate_records(
+    fieldnames: Iterable[str],
+    records: Iterable[Tuple[int, Dict[str, str]]],
+    group_fields: Tuple[str, str, str],
+) -> PivotData:
+    """Validate and aggregate normalized spreadsheet records."""
+
+    required = set(group_fields + VALUE_FIELDS)
+    missing = sorted(required.difference(fieldnames))
+    if missing:
+        raise ValueError("Missing required column(s): " + ", ".join(missing))
+
+    pivot = PivotData()
+    for row_number, row in records:
+        labels = (
+            (row.get(group_fields[0]) or "").strip(),
+            (row.get(group_fields[1]) or "").strip(),
+            (row.get(group_fields[2]) or "").strip(),
+        )
+
+        # Ignore report totals, filter notes, and completely blank rows because
+        # none of them contain the three hierarchy values.
+        if not any(labels):
+            continue
+        if not all(labels):
+            raise ValueError(
+                f"Row {row_number}: hierarchy fields must all be populated; got {labels!r}"
+            )
+
+        amounts = [
+            parse_amount(row.get(field), field, row_number) for field in VALUE_FIELDS
+        ]
+        pivot.add(labels, amounts)
+
+    return pivot
+
+
+def load_pivot(
+    input_path: Path,
+    group_fields: Tuple[str, str, str] = DEFAULT_GROUP_FIELDS,
+    sheet_name: Optional[str] = None,
+) -> PivotData:
+    """Read a spreadsheet and return its aggregated pivot data."""
+
+    fieldnames, records, _selected_sheet = read_input_table(input_path, sheet_name)
+    return aggregate_records(fieldnames, records, group_fields)
+
+
 def load_totals(
     input_path: Path,
     group_fields: Tuple[str, str, str] = DEFAULT_GROUP_FIELDS,
@@ -288,43 +395,16 @@ def load_totals(
     Totals,
     int,
 ]:
-    """Read detail rows and aggregate all three hierarchy levels."""
+    """Return the legacy aggregate tuple for callers that import this script."""
 
-    fieldnames, records, _selected_sheet = read_input_table(input_path, sheet_name)
-    required = set(group_fields + VALUE_FIELDS)
-    missing = sorted(required.difference(fieldnames))
-    if missing:
-        raise ValueError("Missing required column(s): " + ", ".join(missing))
-
-    department_totals: Dict[str, Totals] = {}
-    group_totals: Dict[Tuple[str, str], Totals] = {}
-    category_totals: Dict[Tuple[str, str, str], Totals] = {}
-    grand_total = Totals()
-    detail_count = 0
-
-    for row_number, row in records:
-        labels = tuple((row.get(field) or "").strip() for field in group_fields)
-
-        # Ignore completely blank spreadsheet rows.
-        if not any(labels):
-            continue
-        if not all(labels):
-            raise ValueError(
-                f"Row {row_number}: hierarchy fields must all be populated; got {labels!r}"
-            )
-
-        amounts = [
-            parse_amount(row.get(field), field, row_number) for field in VALUE_FIELDS
-        ]
-        department, group, category = labels
-
-        department_totals.setdefault(department, Totals()).add(amounts)
-        group_totals.setdefault((department, group), Totals()).add(amounts)
-        category_totals.setdefault((department, group, category), Totals()).add(amounts)
-        grand_total.add(amounts)
-        detail_count += 1
-
-    return department_totals, group_totals, category_totals, grand_total, detail_count
+    pivot = load_pivot(input_path, group_fields, sheet_name)
+    return (
+        pivot.departments,
+        pivot.groups,
+        pivot.categories,
+        pivot.grand_total,
+        pivot.detail_count,
+    )
 
 
 def format_amount(amount: Decimal, style: str) -> str:
@@ -345,68 +425,14 @@ def output_row(label: str, totals: Totals, style: str) -> List[str]:
     ]
 
 
-def pivot_rows(
-    department_totals: Dict[str, Totals],
-    group_totals: Dict[Tuple[str, str], Totals],
-    category_totals: Dict[Tuple[str, str, str], Totals],
-    grand_total: Totals,
-) -> Iterator[Tuple[str, str, Totals]]:
-    """Yield each pivot row as (tier, label, totals)."""
-
-    for department in sorted(department_totals, key=str.casefold):
-        yield "department", department, department_totals[department]
-
-        groups = sorted(
-            (group for dept, group in group_totals if dept == department),
-            key=str.casefold,
-        )
-        for group in groups:
-            yield "group", group, group_totals[(department, group)]
-
-            categories = sorted(
-                (
-                    category
-                    for dept, grp, category in category_totals
-                    if dept == department and grp == group
-                ),
-                key=str.casefold,
-            )
-            for category in categories:
-                yield (
-                    "category",
-                    category,
-                    category_totals[(department, group, category)],
-                )
-
-    yield "grand", "Grand Total", grand_total
-
-
-def write_csv(
-    input_path: Path,
-    output_file: TextIO,
-    style: str,
-    group_fields: Tuple[str, str, str] = DEFAULT_GROUP_FIELDS,
-    sheet_name: Optional[str] = None,
-) -> int:
-    """Write the pivot as a CSV compatible with the supplied example."""
-
-    (
-        department_totals,
-        group_totals,
-        category_totals,
-        grand_total,
-        detail_count,
-    ) = load_totals(input_path, group_fields, sheet_name)
+def write_csv(pivot: PivotData, output_file: TextIO, style: str) -> int:
+    """Write aggregated pivot data as CSV."""
 
     writer = csv.writer(output_file, lineterminator="\n")
     writer.writerow(OUTPUT_HEADER)
-
-    rows = pivot_rows(
-        department_totals, group_totals, category_totals, grand_total
-    )
-    for _tier, label, totals in rows:
+    for _tier, label, totals in pivot.rows():
         writer.writerow(output_row(label, totals, style))
-    return detail_count
+    return pivot.detail_count
 
 
 def column_name(number: int) -> str:
@@ -489,26 +515,10 @@ def make_sheet_xml(rows: List[Tuple[str, str, Totals]]) -> str:
 </worksheet>'''
 
 
-def write_xlsx(
-    input_path: Path,
-    output_path: Path,
-    group_fields: Tuple[str, str, str] = DEFAULT_GROUP_FIELDS,
-    sheet_name: Optional[str] = None,
-) -> int:
-    """Write a styled Excel workbook without requiring third-party packages."""
+def write_xlsx(pivot: PivotData, output_path: Path) -> int:
+    """Write aggregated pivot data as a styled Excel workbook."""
 
-    (
-        department_totals,
-        group_totals,
-        category_totals,
-        grand_total,
-        detail_count,
-    ) = load_totals(input_path, group_fields, sheet_name)
-    rows = list(
-        pivot_rows(
-            department_totals, group_totals, category_totals, grand_total
-        )
-    )
+    rows = list(pivot.rows())
 
     content_types = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
@@ -574,7 +584,7 @@ def write_xlsx(
         workbook_file.writestr("xl/_rels/workbook.xml.rels", workbook_rels)
         workbook_file.writestr("xl/styles.xml", styles)
         workbook_file.writestr("xl/worksheets/sheet1.xml", make_sheet_xml(rows))
-    return detail_count
+    return pivot.detail_count
 
 
 def timestamped_path(path: Path, now: Optional[datetime] = None) -> Path:
@@ -649,19 +659,18 @@ def main() -> None:
         if args.no_timestamp
         else timestamped_path(requested_output)
     )
-    output_path.parent.mkdir(parents=True, exist_ok=True)
     suffix = output_path.suffix.casefold()
-    if suffix == ".xlsx":
-        detail_count = write_xlsx(
-            input_path, output_path, group_fields, args.sheet
-        )
-    elif suffix == ".csv":
-        with output_path.open("w", encoding="utf-8-sig", newline="") as output_file:
-            detail_count = write_csv(
-                input_path, output_file, args.format, group_fields, args.sheet
-            )
-    else:
+    if suffix not in {".xlsx", ".csv"}:
         raise SystemExit("Output must have an .xlsx or .csv extension")
+
+    pivot = load_pivot(input_path, group_fields, args.sheet)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if suffix == ".xlsx":
+        detail_count = write_xlsx(pivot, output_path)
+    else:
+        with output_path.open("w", encoding="utf-8-sig", newline="") as output_file:
+            detail_count = write_csv(pivot, output_file, args.format)
+
     print(f"Wrote {output_path} from {detail_count} detail rows")
 
 
