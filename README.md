@@ -3,8 +3,12 @@ Version 1.0 of a python script that takes a .csv file exported from Powerbi webs
 
 The script will process the first .xlsx file in the same folder that is labeled "data.xlsx" and export an .xlxs (Excel) file named "pivoted_report" followed by a timestamp. If no excel file under that name is found, it will search for a local .csv file with the same name.
 
+Made with VS Code w/Astra
+
 
 Changelog:
+
+Oct 2, 2026 - refactored
 
 Sept 28, 2026 - updated to accept .xlsx or .csv (before was only capable of .csv)
 
